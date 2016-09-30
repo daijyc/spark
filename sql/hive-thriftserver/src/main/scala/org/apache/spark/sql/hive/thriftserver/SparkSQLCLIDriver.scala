@@ -20,6 +20,8 @@ package org.apache.spark.sql.hive.thriftserver
 import java.io._
 import java.util.{ArrayList => JArrayList, Locale}
 
+import sun.misc.{SignalHandler, Signal}
+
 import scala.collection.JavaConverters._
 
 import jline.console.ConsoleReader
@@ -37,9 +39,10 @@ import org.apache.hadoop.hive.ql.session.SessionState
 import org.apache.thrift.transport.TSocket
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.{SparkSession, AnalysisException}
 import org.apache.spark.sql.hive.HiveUtils
 import org.apache.spark.util.ShutdownHookManager
+import org.apache.spark.sql.streaming.StreamingQuery
 
 /**
  * This code doesn't support remote connections in Hive 1.2+, as the underlying CliDriver
@@ -244,7 +247,7 @@ private[hive] object SparkSQLCLIDriver extends Logging {
 
         if (line.trim().endsWith(";") && !line.trim().endsWith("\\;")) {
           line = prefix + line
-          ret = cli.processLine(line, true)
+          ret = cli.processLine(line, false)
           prefix = ""
           currentPrompt = promptWithCurrentDB
         } else {
@@ -278,6 +281,7 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
   private val isRemoteMode = {
     SparkSQLCLIDriver.isRemoteMode(sessionState)
   }
+  private var activeQuery : StreamingQuery = null
 
   private val conf: Configuration =
     if (sessionState != null) sessionState.getConf else new Configuration()
@@ -290,6 +294,18 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
     // Hive 1.2 + not supported in CLI
     throw new RuntimeException("Remote operations not supported")
   }
+  installSignalHandler()
+
+  def installSignalHandler() {
+    val interruptSignal = new Signal("INT");
+    Signal.handle(interruptSignal, new SignalHandler() {
+      def handle(sig: Signal) {
+        if (activeQuery != null) {
+          activeQuery.stop()
+        }
+      }
+    })
+  }
 
   override def processCmd(cmd: String): Int = {
     val cmd_trimmed: String = cmd.trim()
@@ -301,14 +317,31 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
       sessionState.close()
       System.exit(0)
     }
+    val start: Long = System.currentTimeMillis()
     if (tokens(0).toLowerCase(Locale.ENGLISH).equals("source") ||
       cmd_trimmed.startsWith("!") || isRemoteMode) {
-      val start = System.currentTimeMillis()
       super.processCmd(cmd)
       val end = System.currentTimeMillis()
       val timeTaken: Double = (end - start) / 1000.0
       console.printInfo(s"Time taken: $timeTaken seconds")
       0
+    } else if (tokens(0).toLowerCase(Locale.ENGLISH).equals("streaming")) {
+      var ret = 0
+      try {
+        val spark: SparkSession = SparkSession.builder.enableHiveSupport.appName("StructuredStreamingCLIDriver").getOrCreate
+        activeQuery = spark.sql(cmd.substring("streaming".length+1))
+          .writeStream
+          .outputMode("complete")
+          .format("console")
+          .start();
+        activeQuery.awaitTermination
+        activeQuery = null
+      } catch {
+        case e: Throwable => println("Got exception: " + e)
+      }
+      val end = System.currentTimeMillis()
+      val timeTaken: Double = (end - start) / 1000.0
+      ret
     } else {
       var ret = 0
       val hconf = conf.asInstanceOf[HiveConf]
@@ -324,7 +357,6 @@ private[hive] class SparkSQLCLIDriver extends CliDriver with Logging {
           driver.init()
           val out = sessionState.out
           val err = sessionState.err
-          val start: Long = System.currentTimeMillis()
           if (sessionState.getIsVerbose) {
             out.println(cmd)
           }

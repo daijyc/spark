@@ -179,6 +179,17 @@ private[hive] class HiveMetastoreCatalog(sparkSession: SparkSession) extends Log
         case Some(aliasText) =>
           SubqueryAlias(aliasText, sessionState.sqlParser.parsePlan(viewText))
       }
+    } else if (table.properties.get("streaming.type").isDefined
+        && table.properties.get("streaming.type").orNull == "socket") {
+      val names = table.schema.map(s => s.name)
+      var lines = sparkSession
+        .readStream.format("socket")
+        .option("host", table.properties.get("streaming.socket.host").orNull)
+        .option("port", table.properties.get("streaming.socket.port").orNull)
+        .option("includeTimestamp", table.properties.get("streaming.socket.includeTimestamp").orNull)
+        .load
+      lines = lines.toDF(names: _*)
+        SubqueryAlias(table.qualifiedName, lines.logicalPlan)
     } else {
       MetastoreRelation(
         qualifiedTableName.database, qualifiedTableName.name, alias)(table, client, sparkSession)
